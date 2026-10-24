@@ -10,6 +10,8 @@ GET /health -> { ok: true }
 import io
 import sys
 import os
+import math
+import traceback
 
 # reader.py sits alongside main.py in this repo
 sys.path.insert(0, os.path.dirname(__file__))
@@ -28,7 +30,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Lazy-load reader on first request (RapidOCR model download takes time)
 _reader = None
 
 def get_reader():
@@ -39,35 +40,58 @@ def get_reader():
     return _reader
 
 
+def to_num(v):
+    if v is None:
+        return None
+    try:
+        n = float(str(v).replace(',', '').strip())
+        return n if math.isfinite(n) else None
+    except (ValueError, TypeError):
+        return None
+
+
 @app.get("/health")
 def health():
     return {"ok": True}
 
 
 @app.post("/read")
-async def read_parchi(
+def read_parchi(
     photo: UploadFile = File(...),
     kind: str = Form("silver"),
     rate_kg: float = Form(205000),
 ):
-    r = get_reader()
-    data = await photo.read()
-    arr = np.frombuffer(data, dtype=np.uint8)
-    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-    if img is None:
-        return {"error": "Could not decode image", "rows": []}
-    rows, tilt, (W, H) = r.read_image(img)
-    out = []
-    for row in rows:
-        c = r.compute_row(row, rate_kg)
-        out.append({
-            "item": c.get("item") or "",
-            "gwt": c.get("gwt"),
-            "net": c.get("net"),
-            "tw": c.get("tw"),
-            "tunch": c.get("tunch"),
-            "labour_rs": c.get("labour"),
-            "silver_wt": c.get("silver"),
-            "flag": c.get("flag") or "",
-        })
-    return {"rows": out, "tilt": round(tilt, 2), "count": len(out)}
+    try:
+        r = get_reader()
+        data = photo.file.read()
+        arr = np.frombuffer(data, dtype=np.uint8)
+        img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        if img is None:
+            return {"error": "Could not decode image", "rows": []}
+
+        # Auto-scale large images so RapidOCR runs fast and fits safely in free-tier memory
+        H, W = img.shape[:2]
+        max_dim = 1200
+        if max(H, W) > max_dim:
+            scale = max_dim / float(max(H, W))
+            new_w, new_h = max(1, int(W * scale)), max(1, int(H * scale))
+            img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+
+        rows, tilt, (w_cur, h_cur) = r.read_image(img)
+        out = []
+        for row in rows:
+            c = r.compute_row(row, rate_kg)
+            out.append({
+                "item": c.get("item") or "",
+                "gwt": to_num(c.get("gwt")),
+                "net": to_num(c.get("net")),
+                "tw": to_num(c.get("tw")),
+                "tunch": to_num(c.get("tunch")),
+                "labour_rs": to_num(c.get("labour")),
+                "silver_wt": to_num(c.get("silver")),
+                "flag": c.get("flag") or "",
+            })
+        return {"rows": out, "tilt": round(tilt, 2), "count": len(out)}
+    except Exception as e:
+        traceback.print_exc()
+        return {"error": str(e), "rows": []}
